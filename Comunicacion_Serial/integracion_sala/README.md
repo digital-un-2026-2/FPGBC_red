@@ -28,6 +28,24 @@ SC y RX pasan por dos registros independientes de `clk_sys`. No se sincroniza ni
 * Para ambas direcciones, presupuestar como máximo 4 veces el menor periodo local **en total** para propagación de SC de ida, dato de vuelta, pads, traductores y skew de placa/cable. Además del retardo de reconocimiento/relanzamiento local, medir que el dato en el pin receptor se mantenga estable desde al menos tres periodos locales antes hasta tres después de cada descenso observado en su entrada de SC (en HOST, respecto a `sc_out`). Márgenes de diseño, no características medidas del hardware.
 * `core_rx` se registra un tick local antes del descenso de `core_clk`; `core_word`/`core_valid` se usan en el siguiente tick de `clk_sys`. `active_word` se fija desde el encabezado y se mantiene todo el cuerpo. Verificar post-route setup **y hold** entre registros de `clk_sys` y ambos flancos del reloj generado, con presupuesto máximo de un periodo local menos setup, incertidumbre y skew para caminos de un tick. Revisar recuperación/remoción del reset interno `core_cs` antes del primer flanco activo. Un reloj generado periódico a frecuencia media no modela correctamente los flancos habilitados y las pausas; verificar los caminos de un tick explícitamente. Sólo las entradas externas hasta su primer sincronizador son entradas asíncronas. Sin placa/top/pines finales no hay restricciones de implementación cerradas ni informe STA.
 
+## Revisar las señales en GTKWave
+
+Desde `Comunicacion_Serial/integracion_sala`, para abrir la captura incluida sin recompilar:
+
+```bash
+gzip -dc ondas/sala.vcd.gz > sala.vcd
+gtkwave sala.vcd ondas/sala.gtkw
+```
+
+`sc` es el reloj del cable y `oa`/`ob` indican quién lo conduce. En la primera ráfaga se ve un bit de presencia y 32 de datos en cada sentido (`xa`, `xb`). Al activarse `fa` y `fb`, A recibe `76543210` en `ya` y B recibe `80000001` en `yb` (hexadecimal). Es la simulación del transporte, no la negociación del menú ni una captura física.
+
+Para **regenerar** `sala.vcd` con Icarus tras cambiar el RTL (relojes locales de 10 y 12 ns):
+
+```bash
+iverilog -g2012 -Wall -s tb_sala -s captura -o sala.sim ondas/captura.v tb_sala.sv sala_transport.v ../comunicacion_serial.v && vvp sala.sim
+gtkwave sala.vcd ondas/sala.gtkw
+```
+
 ## Reproducir
 
 Desde este directorio: `bash check.sh` (o `bash check.sh sim` / `bash check.sh synth`). Icarus elabora sólo `tb_sala`. El test usa relojes locales de periodos 10 ns frente a 8, 10 y 12 ns con desfase y retardos ideales de cable. Compara palabras en ambos sentidos, formato sobre el cable, fin de palabra, buzón lleno, NOP/cero, pausas, reloj parado alto/bajo, reset del guest durante una trama y roles invertidos en otra sesión. Yosys extrae en un directorio temporal exclusivamente el módulo `serial_endpoint` porque su archivo también contiene un testbench sin directivas de síntesis. Hace `synth_gowin -noiopads` y `check -assert`; no se duplica ni edita el original.
