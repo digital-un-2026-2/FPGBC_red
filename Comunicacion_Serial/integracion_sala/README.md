@@ -1,0 +1,35 @@
+# Transporte de sala: después de crear/unirse
+
+`sala_transport.v` es el mismo bloque para ambas consolas. **No descubre salas ni concede roles.** Software negocia primero por UART, confirma la misma sesión con el par y aplica `grant` desde registros de `clk_sys`. No hay pin CS ni selección de rol por silencio.
+
+| grant | SC | dato TX local | actividad |
+|---|---|---|---|
+| 00 / 11 / reset | liberado | liberado | descarta colas y borra errores en el próximo `clk_sys` |
+| 01 HOST | salida push-pull, empieza en bajo | salida | sondea periódicamente incluso sin TX |
+| 10 GUEST | entrada | salida | espera un intervalo bajo válido y luego los pulsos del host |
+
+`sc_oe` y `data_oe` habilitan **drivers locales de pad**, no son OE de un traductor. `data_in` y `data_out` corresponden a dos caminos distintos, TX de uno a RX del otro. Se requiere una referencia GND común. La única combinación activa permitida es un host y un guest. Dos grants HOST válidos en placas diferentes **sí pueden causar contención**: el bloque no la detecta ni la resuelve. Usar `grant` registrado, no entradas asíncronas; mantener `rst` alto al arrancar al menos dos ciclos locales. Entre sesiones, ambos deben soltar el enlace y mantener `grant=00` al menos dos ciclos locales; confirmar liberación antes de permitir un host nuevo. No invertir directamente `01↔10`.
+
+**Frontera con el juego.** `pongv2/hal_fpgbc.c` usa actualmente la UART del GB Link para `hal_link_send/recv`. Una UART funciona sin SC; eso no significa que, si comparte SI/SO, siga disponible al usar este transporte. Con cables distintos de verdad se puede mantener el canal de control UART. Si comparten pads, hacen falta un protocolo de entrega/retorno acordado (incluidos drenaje de la UART, silencio de ambos TX, ACK y recuperación ante ACK perdido), un mux de pads con liberación antes de conectar, CSRs y un backend HAL para palabras o paquetes. No están implementados aquí. No activar este bloque al ver únicamente el menú «crear» o «unirse».
+
+## Cable y buzones
+
+Cada sondeo tiene **33 ciclos**: un bit de presencia propio de cada sentido y 32 bits MSB primero. Se lanza después del ascenso y se captura en el descenso. `presencia=0` es NOP; sus 32 bits son indiferentes. `presencia=1` admite cualquiera de las 2^32 palabras, incluido cero. El host cuenta exactamente 33 pulsos; entre el último descenso y el siguiente ascenso deja SC bajo durante 192 ciclos de su reloj. Dentro de un sondeo cada semiperiodo dura 24 ciclos. No es el protocolo Game Boy nativo ni un stream UART ni es compatible en cable con el testbench original que sí usa CS.
+
+* `tx_valid && tx_ready` en un flanco ascendente **encola**, no confirma entrega. El productor conserva `tx_data/tx_valid` mientras espera. Un buzón pendiente y una palabra activa independiente; lo ya encolado al detectar el primer ascenso se mueve a la trama. Una aceptación en ese mismo ciclo queda para la siguiente si el buzón estaba vacío. No hay reintentos.
+* `rx_valid && rx_ready` **consume** la palabra local; mientras se espera, `rx_data` permanece estable. Un buzón RX. Si llega otra palabra con el buzón ocupado sin lectura simultánea, se conserva la antigua, se descarta la nueva y se marca `overflow`. El receptor no puede frenar el cable.
+* Tras 64 ciclos locales sin transición en SC sincronizado, bajo habilita el siguiente encabezado; alto sólo descarta la alineación. Si la trama era parcial se marca `frame_loss`. Ningún timeout concede el reloj. `overflow` y `frame_loss` son persistentes hasta reset o deshabilitación. Un peer ausente entre tramas, un dato alterado o la pérdida completa de una trama **no son detectables** aquí: no hay CRC, ACK, replay ni prueba de vida. Si se corta en el último bit se puede recibir una palabra aparentemente completa. Las autorizaciones y la liveness de la sala pertenecen a una capa superior.
+
+## Relojes: contrato obligatorio antes de conectar hardware
+
+SC y RX pasan por dos registros independientes de `clk_sys`. No se sincroniza ningún bus de 32 bits entre placas. El núcleo `serial_endpoint` original se instancia sin cambios: conserva la carga/desplazamiento en ascenso y la captura en descenso. Su `cs` es **interno**; su reloj es una réplica registrada (`core_clk`) que sólo avanza con los 32 bits de cuerpo. No es una implementación de un único árbol de reloj. Asignar un reloj a `clk_sys`, mantener los sincronizadores juntos y usar ruta de reloj apropiada para `core_clk`. No declarar `core_clk` asíncrono a `clk_sys` ni poner `false_path` en los buses de palabra.
+
+* Objetivo conservador de integración: `0.8 ≤ Tguest/Thost ≤ 1.25`. El semiperiodo normal debe quedar claramente por debajo del umbral de 64 ticks del receptor; la pausa debe superarlo, dejando margen para sincronización. Los pulsos espurios no se filtran. SC liberado necesita un nivel bajo definido; un pin flotante no cumple el contrato.
+* Para ambas direcciones, presupuestar como máximo 4 veces el menor periodo local **en total** para propagación de SC de ida, dato de vuelta, pads, traductores y skew de placa/cable. Además del retardo de reconocimiento/relanzamiento local, medir que el dato en el pin receptor se mantenga estable desde al menos tres periodos locales antes hasta tres después de cada descenso observado en su entrada de SC (en HOST, respecto a `sc_out`). Márgenes de diseño, no características medidas del hardware.
+* `core_rx` se registra un tick local antes del descenso de `core_clk`; `core_word`/`core_valid` se usan en el siguiente tick de `clk_sys`. `active_word` se fija desde el encabezado y se mantiene todo el cuerpo. Verificar post-route setup **y hold** entre registros de `clk_sys` y ambos flancos del reloj generado, con presupuesto máximo de un periodo local menos setup, incertidumbre y skew para caminos de un tick. Revisar recuperación/remoción del reset interno `core_cs` antes del primer flanco activo. Un reloj generado periódico a frecuencia media no modela correctamente los flancos habilitados y las pausas; verificar los caminos de un tick explícitamente. Sólo las entradas externas hasta su primer sincronizador son entradas asíncronas. Sin placa/top/pines finales no hay restricciones de implementación cerradas ni informe STA.
+
+## Reproducir
+
+Desde este directorio: `bash check.sh` (o `bash check.sh sim` / `bash check.sh synth`). Icarus elabora sólo `tb_sala`. El test usa relojes locales de periodos 10 ns frente a 8, 10 y 12 ns con desfase y retardos ideales de cable. Compara palabras en ambos sentidos, formato sobre el cable, fin de palabra, buzón lleno, NOP/cero, pausas, reloj parado alto/bajo, reset del guest durante una trama y roles invertidos en otra sesión. Yosys extrae en un directorio temporal exclusivamente el módulo `serial_endpoint` porque su archivo también contiene un testbench sin directivas de síntesis. Hace `synth_gowin -noiopads` y `check -assert`; no se duplica ni edita el original.
+
+Esto verifica lógica y mapeo, no pinout, continuidad, niveles, pull resistors, traductores, integridad eléctrica, timing físico ni dos placas reales. No se generó ni cargó un bitstream.
